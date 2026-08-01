@@ -24,9 +24,9 @@ namespace syscall::hashing
         return getConfiguredSeed();
     }
 
-    constexpr Hash_t currentSeed = getConfiguredSeed();
-    constexpr Hash_t polyKey1 = 0xAF6F01BD5B2D7583ULL ^ currentSeed;
-    constexpr Hash_t polyKey2 = 0xB4F281729182741DULL ^ std::rotr(currentSeed, 7);
+    inline constexpr Hash_t currentSeed = getConfiguredSeed();
+    inline constexpr Hash_t polyKey1 = 0xAF6F01BD5B2D7583ULL ^ currentSeed;
+    inline constexpr Hash_t polyKey2 = 0xB4F281729182741DULL ^ std::rotr(currentSeed, 7);
 
     consteval Hash_t calculateHash(const char* szData)
     {
