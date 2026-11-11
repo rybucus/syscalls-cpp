@@ -23,3 +23,8 @@ add_executable(test_integration test_integration.cpp)
 target_link_libraries(test_integration PRIVATE syscalls-cpp GTest::gtest_main)
 target_compile_features(test_integration PRIVATE cxx_std_20)
 add_test(NAME test_integration COMMAND $<TARGET_FILE:test_integration>)
+
+add_executable(test_source test_source.cpp)
+target_link_libraries(test_source PRIVATE syscalls-cpp GTest::gtest_main)
+target_compile_features(test_source PRIVATE cxx_std_20)
+add_test(NAME test_source COMMAND $<TARGET_FILE:test_source>)

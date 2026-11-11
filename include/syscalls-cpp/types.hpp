@@ -14,6 +14,8 @@ namespace syscall
         uint8_t* m_pModuleBase = nullptr;
         IMAGE_NT_HEADERS* m_pNtHeaders = nullptr;
         IMAGE_EXPORT_DIRECTORY* m_pExportDir = nullptr;
+        HANDLE m_hSectionHandle = nullptr;
+        bool m_bOwned = false;
     };
 
 #ifdef SYSCALLS_NO_HASH

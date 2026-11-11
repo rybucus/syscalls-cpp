@@ -16,9 +16,10 @@ namespace syscall
             : Manager<AllocPolicy, StubPolicy, syscall::policies::parser::directory, syscall::policies::parser::signature>(std::move(manager))
         { }
     public:
+        template<IsModuleSourcePolicy IModuleSource = policies::module_source::LoadedInMemory>
         static std::optional<Manager> create(const std::vector<SyscallKey_t>& vecModuleKeys = { SYSCALL_ID("ntdll.dll") })
         {
-            std::optional optManager = Manager<AllocPolicy, StubPolicy, syscall::policies::parser::directory, syscall::policies::parser::signature>::initialize(vecModuleKeys);
+            std::optional optManager = Manager<AllocPolicy, StubPolicy, syscall::policies::parser::directory, syscall::policies::parser::signature>::template initialize<IModuleSource>(vecModuleKeys);
 
             if (!optManager.has_value())
                 return std::nullopt;
@@ -26,9 +27,10 @@ namespace syscall
             return Manager(std::move(optManager.value()));
         }
 
+        template<IsModuleSourcePolicy IModuleSource = policies::module_source::LoadedInMemory>
         static std::optional<Manager> initialize(const std::vector<SyscallKey_t>& vecModuleKeys = { SYSCALL_ID("ntdll.dll") })
         {
-            return create(vecModuleKeys);
+            return create<IModuleSource>(vecModuleKeys);
         }
     };
 
@@ -40,18 +42,20 @@ namespace syscall
             : ManagerImpl<AllocPolicy, StubPolicy, ParsersInChain...>(std::move(managerImpl))
         { }
     public:
+        template<IsModuleSourcePolicy IModuleSource = policies::module_source::LoadedInMemory>
         static std::optional<Manager> create(const std::vector<SyscallKey_t>& vecModuleKeys = { SYSCALL_ID("ntdll.dll") })
         {
-            std::optional optManagerImpl = ManagerImpl<AllocPolicy, StubPolicy, ParsersInChain...>::initialize(vecModuleKeys);
+            std::optional optManagerImpl = ManagerImpl<AllocPolicy, StubPolicy, ParsersInChain...>::template initialize<IModuleSource>(vecModuleKeys);
             if (!optManagerImpl.has_value())
                 return std::nullopt;
 
             return Manager(std::move(optManagerImpl.value()));
         }
 
+        template<IsModuleSourcePolicy IModuleSource = policies::module_source::LoadedInMemory>
         static std::optional<Manager> initialize(const std::vector<SyscallKey_t>& vecModuleKeys = { SYSCALL_ID("ntdll.dll") })
         {
-            return create(vecModuleKeys);
+            return create<IModuleSource>(vecModuleKeys);
         }
     };
 

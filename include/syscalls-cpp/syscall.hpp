@@ -104,6 +104,9 @@ namespace syscall
 #include "generator/direct.hpp"
 #include "parser/directory.hpp"
 #include "parser/signature.hpp"
+#include "source/source.hpp"
+#include "source/loaded_in_memory.hpp"
+#include "source/disk_based.hpp"
 
 namespace syscall
 {
@@ -256,6 +259,7 @@ namespace syscall
         }
 
     protected:
+        template<IsModuleSourcePolicy IModuleSource = policies::module_source::LoadedInMemory>
         [[nodiscard]] static std::optional<ManagerImpl> initialize(const std::vector<SyscallKey_t>& vecModuleKeys)
         {
             std::vector<void*> vecSyscallGadgets = {};
@@ -272,10 +276,12 @@ namespace syscall
             for (const auto& moduleKey : vecModuleKeys)
             {
                 ModuleInfo_t moduleInfo;
-                if (!getModuleInfo(moduleKey, moduleInfo))
+                if (!IModuleSource::resolve(moduleKey, moduleInfo))
                     continue;
 
                 std::vector<SyscallEntry_t> moduleSyscalls = tryParseSyscalls<IFirstParser, IFallbackParsers...>(moduleInfo);
+
+                IModuleSource::release(moduleInfo);
 
                 vecParsedSyscalls.insert(vecParsedSyscalls.end(), moduleSyscalls.begin(), moduleSyscalls.end());
             }
@@ -444,36 +450,11 @@ namespace syscall
             };
         }
 
-        static bool getModuleInfo(SyscallKey_t moduleKey, ModuleInfo_t& info)
-        {
-            HMODULE hModule = native::getModuleBase(moduleKey);
-            if (!hModule)
-                return false;
-
-            info.m_pModuleBase = reinterpret_cast<uint8_t*>(hModule);
-
-            auto pDosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(info.m_pModuleBase);
-            if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE)
-                return false;
-
-            info.m_pNtHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(info.m_pModuleBase + pDosHeader->e_lfanew);
-            if (info.m_pNtHeaders->Signature != IMAGE_NT_SIGNATURE)
-                return false;
-
-            auto uExportRva = info.m_pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-            if (!uExportRva)
-                return false;
-
-            info.m_pExportDir = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(info.m_pModuleBase + uExportRva);
-
-            return true;
-        }
-
 #if SYSCALL_PLATFORM_WINDOWS_64
         static std::vector<void*> findSyscallGadgets()
         {
             ModuleInfo_t ntdll;
-            if (!getModuleInfo(SYSCALL_ID("ntdll.dll"), ntdll))
+            if (!policies::module_source::LoadedInMemory::resolve(SYSCALL_ID("ntdll.dll"), ntdll))
                 return {};
 
             IMAGE_SECTION_HEADER* pSections = IMAGE_FIRST_SECTION(ntdll.m_pNtHeaders);
