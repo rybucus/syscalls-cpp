@@ -81,9 +81,9 @@ The power is in the combination. Here is how you build and use a syscall manager
 #include "syscall.hpp"
 
 int main() {
-    syscall::SectionDirectManager syscallManager;
-    // you can add your own modules for parsing syscalls, by default only ntdll is parsed
-    if (!syscallManager.initialize(/* SYSCALL_ID("ntdll.dll"),  SYSCALL_ID("win32u.dll")*/))
+    auto syscallManager = syscall::SectionDirectManager::create();
+    // Add module keys to create({ ... }); when more than ntdll is needed.
+    if (!syscallManager)
     {
         std::cerr << "initialization failed!\n";
         return 1;
@@ -92,7 +92,7 @@ int main() {
     PVOID pBaseAddress = nullptr;
     SIZE_T uSize = 0x1000;
 
-    syscallManager.invoke<NTSTATUS>(
+    syscallManager->invoke<NTSTATUS>(
         SYSCALL_ID("NtAllocateVirtualMemory"),
         NtCurrentProcess(),
         &pBaseAddress,
@@ -118,21 +118,18 @@ For more control, you can specify your own policy or build a custom allocators /
 using UniqueSecretOwnPolicyManager = syscall::Manager<
         syscall::policies::allocator::heap, // heap allocator
         syscall::policies::generator::direct, // direct!!
-        DefaultParserChain  // default exception/sort directory + improved halo gates as a fallback is used
+        syscall::policies::parser::directory,
+        syscall::policies::parser::signature
 >;
 
-// or, let's build a custom parser chain using the ParserChain_t helper
+// Or select a custom parser chain directly:
 // imagine you wrote a MyCustomParser policy
 /*
-using MyParserChain = syscall::ParserChain_t<
-    MyCustomParser,
-    syscall::policies::SignatureScanningParser
->;
-
 using SuperCustomManager = syscall::Manager<
-    syscall::policies::HeapAllocator,
-    syscall::policies::GadgetStubGenerator,
-    MyParserChain // own custom chain!!!
+    syscall::policies::allocator::heap,
+    syscall::policies::generator::direct,
+    MyCustomParser,
+    syscall::policies::parser::signature
 >;
 */
 ```
@@ -147,7 +144,13 @@ using SuperCustomManager = syscall::Manager<
 
 ## Extensibility
 
-The true power of the framework is its extensibility. You can easily write your own policies. Simply create a class that satisfies the required `concept` (`IsAllocationPolicy`, `IsStubGenerationPolicy`, or `IsSyscallParsingPolicy`), and it will be seamlessly compatible with the `Manager`.
+The true power of the framework is its extensibility. You can write custom allocation, generator, and parser policies that satisfy the corresponding concepts.
+
+Managers are fully initialized by `create()` and are immutable afterwards. A manager can be moved into a new owner, but its lifetime must cover every `invoke()` call. Concurrent `const invoke()` calls are supported; destruction must not overlap an invocation.
+
+Parser policies are tried in order. A fallback parser is used only when the preceding parser returns an empty result. Results from multiple modules are normalized: duplicate keys with the same syscall number are merged, while conflicting syscall numbers make initialization fail.
+
+Custom generators use `bRequiresGadget`, `getStubSize()`, and `generate()`. A generator that uses exception dispatch must additionally provide `static constexpr bool bRequiresExceptionDispatch = true`.
 
 ## Configuration
 

@@ -11,7 +11,7 @@
 #include <mutex>
 #include <cstring>
 #include <utility>
-#include <concepts> 
+#include <concepts>
 #include <array>
 #include <random>
 #include <algorithm>
@@ -28,18 +28,23 @@
 namespace syscall
 {
 
-    inline thread_local struct ExceptionContext_t
+    struct ExceptionContext_t
     {
         bool m_bShouldHandle = false;
         const void* m_pExpectedExceptionAddress = nullptr;
         void* m_pSyscallGadget = nullptr;
         uint32_t m_uSyscallNumber = 0;
-    } pExceptionContext;
+    };
+
+    inline thread_local ExceptionContext_t pExceptionContext;
 
     class CExceptionContextGuard
     {
+        ExceptionContext_t m_previousContext;
+
     public:
         CExceptionContextGuard(const void* pExpectedAddress, void* pSyscallGadget, uint32_t uSyscallNumber)
+            : m_previousContext(pExceptionContext)
         {
             pExceptionContext.m_bShouldHandle = true;
             pExceptionContext.m_pExpectedExceptionAddress = pExpectedAddress;
@@ -49,14 +54,14 @@ namespace syscall
 
         ~CExceptionContextGuard()
         {
-            pExceptionContext.m_bShouldHandle = false;
+            pExceptionContext = m_previousContext;
         }
 
         CExceptionContextGuard(const CExceptionContextGuard&) = delete;
         CExceptionContextGuard& operator=(const CExceptionContextGuard&) = delete;
     };
 
-    static LONG NTAPI VectoredExceptionHandler(PEXCEPTION_POINTERS pExceptionInfo)
+    inline LONG NTAPI VectoredExceptionHandler(PEXCEPTION_POINTERS pExceptionInfo)
     {
         if (!pExceptionContext.m_bShouldHandle)
             return EXCEPTION_CONTINUE_SEARCH;
@@ -102,6 +107,53 @@ namespace syscall
 
 namespace syscall
 {
+    namespace detail
+    {
+        inline std::mutex g_vehMutex;
+        inline void* g_pVehHandle = nullptr;
+        inline std::size_t g_uVehUsers = 0;
+
+        inline void* acquireVeh()
+        {
+            std::lock_guard lock(g_vehMutex);
+
+            if (!g_pVehHandle)
+                g_pVehHandle = AddVectoredExceptionHandler(1, VectoredExceptionHandler);
+
+            if (g_pVehHandle)
+                ++g_uVehUsers;
+
+            return g_pVehHandle;
+        }
+
+        inline void releaseVeh()
+        {
+            std::lock_guard lock(g_vehMutex);
+
+            if (!g_uVehUsers)
+                return;
+
+            if (--g_uVehUsers == 0)
+            {
+                RemoveVectoredExceptionHandler(g_pVehHandle);
+                g_pVehHandle = nullptr;
+            }
+        }
+    }
+
+    template<typename T, typename = void>
+    struct GeneratorTraits
+    {
+        static constexpr bool bRequiresGadget = T::bRequiresGadget;
+        static constexpr bool bRequiresExceptionDispatch = false;
+    };
+
+    template<typename T>
+    struct GeneratorTraits<T, std::void_t<decltype(T::bRequiresExceptionDispatch)>>
+    {
+        static constexpr bool bRequiresGadget = T::bRequiresGadget;
+        static constexpr bool bRequiresExceptionDispatch = T::bRequiresExceptionDispatch;
+    };
 
     template<typename T>
     concept IsIAllocationPolicy = requires(size_t uSize, const std::span<const uint8_t>vecBuffer, void*& pRegion, HANDLE & hObject)
@@ -122,12 +174,6 @@ namespace syscall
     concept IsSyscallParsingPolicy = requires(const ModuleInfo_t & module)
     {
         { T::parse(module) } -> std::convertible_to<std::vector<SyscallEntry_t>>;
-    };
-
-    template<IsSyscallParsingPolicy... IParsers>
-    struct ParserChain_t
-    {
-        static_assert(sizeof...(IParsers) > 0, "Parsedchain_t cannot be empty.");
     };
 
     template<
@@ -160,21 +206,36 @@ namespace syscall
             "1. 'static std::vector<SyscallEntry_t> parse(const ModuleInfo_t&);'"
             );
 
-        std::mutex m_mutex;
+        ManagerImpl(std::vector<SyscallEntry_t>&& vecParsedSyscalls, void* pSyscallRegion, std::vector<void*>&& vecSyscallGadgets, std::size_t uRegionSize, HANDLE hObjectHandle, void* pVehHandle)
+            : m_vecParsedSyscalls(std::move(vecParsedSyscalls))
+            , m_pSyscallRegion(pSyscallRegion)
+            , m_vecSyscallGadgets(std::move(vecSyscallGadgets))
+            , m_uRegionSize(uRegionSize)
+            , m_hObjectHandle(hObjectHandle)
+            , m_pVehHandle(pVehHandle)
+        {
+        }
+
         std::vector<SyscallEntry_t> m_vecParsedSyscalls;
         void* m_pSyscallRegion = nullptr;
         std::vector<void*> m_vecSyscallGadgets;
         size_t m_uRegionSize = 0;
-        bool m_bInitialized = false;
         HANDLE m_hObjectHandle = nullptr;
         void* m_pVehHandle = nullptr;
+
+        struct SyscallInitInfo_t
+        {
+            void* m_pSyscallRegion = nullptr;
+            std::size_t m_uRegionSize = 0;
+            HANDLE m_hObjectHandle = nullptr;
+        };
+
     public:
-        ManagerImpl() = default;
         ~ManagerImpl()
         {
-            if constexpr (platform::isWindows64)
+            if constexpr (GeneratorTraits<IStubGenerationPolicy>::bRequiresExceptionDispatch)
                 if (m_pVehHandle)
-                    RemoveVectoredExceptionHandler(m_pVehHandle);
+                    detail::releaseVeh();
 
             IAllocationPolicy::release(m_pSyscallRegion, m_hObjectHandle);
         }
@@ -182,53 +243,32 @@ namespace syscall
         ManagerImpl(const ManagerImpl&) = delete;
         ManagerImpl& operator=(const ManagerImpl&) = delete;
         ManagerImpl(ManagerImpl&& other) noexcept
+            : m_vecParsedSyscalls(std::move(other.m_vecParsedSyscalls))
+            , m_pSyscallRegion(other.m_pSyscallRegion)
+            , m_vecSyscallGadgets(std::move(other.m_vecSyscallGadgets))
+            , m_uRegionSize(other.m_uRegionSize)
+            , m_hObjectHandle(other.m_hObjectHandle)
+            , m_pVehHandle(other.m_pVehHandle)
         {
-            std::lock_guard<std::mutex> lock(other.m_mutex);
-            m_vecParsedSyscalls = std::move(other.m_vecParsedSyscalls);
-            m_pSyscallRegion = other.m_pSyscallRegion;
-            m_vecSyscallGadgets = std::move(other.m_vecSyscallGadgets);
-            m_uRegionSize = other.m_uRegionSize;
-            m_bInitialized = other.m_bInitialized;
-            m_hObjectHandle = other.m_hObjectHandle;
             other.m_pSyscallRegion = nullptr;
             other.m_hObjectHandle = nullptr;
+            other.m_pVehHandle = nullptr;
         }
 
-        ManagerImpl& operator=(ManagerImpl&& other) noexcept
+    protected:
+        [[nodiscard]] static std::optional<ManagerImpl> initialize(const std::vector<SyscallKey_t>& vecModuleKeys)
         {
-            if (this != &other)
-            {
-                std::scoped_lock lock(m_mutex, other.m_mutex);
-                IAllocationPolicy::release(m_pSyscallRegion, m_hObjectHandle);
-                m_vecParsedSyscalls = std::move(other.m_vecParsedSyscalls);
-                m_pSyscallRegion = other.m_pSyscallRegion;
-                m_vecSyscallGadgets = std::move(other.m_vecSyscallGadgets);
-                m_uRegionSize = other.m_uRegionSize;
-                m_bInitialized = other.m_bInitialized;
-                m_hObjectHandle = other.m_hObjectHandle;
-                other.m_pSyscallRegion = nullptr;
-                other.m_hObjectHandle = nullptr;
-            }
-
-            return *this;
-        }
-
-        [[nodiscard]] bool initialize(const std::vector<SyscallKey_t>& vecModuleKeys = { SYSCALL_ID("ntdll.dll") })
-        {
-            if (m_bInitialized)
-                return true;
-
-            std::lock_guard<std::mutex> lock(m_mutex);
-
-            if (m_bInitialized)
-                return true;
+            std::vector<void*> vecSyscallGadgets = {};
 #if SYSCALL_PLATFORM_WINDOWS_64
-            if constexpr (IStubGenerationPolicy::bRequiresGadget)
-                if (!findSyscallGadgets())
-                    return false;
+            if constexpr (GeneratorTraits<IStubGenerationPolicy>::bRequiresGadget)
+            {
+                vecSyscallGadgets = findSyscallGadgets();
+                if (vecSyscallGadgets.empty())
+                    return std::nullopt;
+            }
 #endif
 
-            m_vecParsedSyscalls.clear();
+            std::vector<SyscallEntry_t> vecParsedSyscalls = {};
             for (const auto& moduleKey : vecModuleKeys)
             {
                 ModuleInfo_t moduleInfo;
@@ -237,52 +277,77 @@ namespace syscall
 
                 std::vector<SyscallEntry_t> moduleSyscalls = tryParseSyscalls<IFirstParser, IFallbackParsers...>(moduleInfo);
 
-                m_vecParsedSyscalls.insert(m_vecParsedSyscalls.end(), moduleSyscalls.begin(), moduleSyscalls.end());
+                vecParsedSyscalls.insert(vecParsedSyscalls.end(), moduleSyscalls.begin(), moduleSyscalls.end());
             }
 
-            if (m_vecParsedSyscalls.empty())
-                return false;
+            if (vecParsedSyscalls.empty())
+                return std::nullopt;
 
-            if (m_vecParsedSyscalls.size() > 1)
-                for (size_t i = m_vecParsedSyscalls.size() - 1; i > 0; --i)
-                    std::swap(m_vecParsedSyscalls[i], m_vecParsedSyscalls[native::rdtscp() % (i + 1)]);
+            const size_t uStubSize = IStubGenerationPolicy::getStubSize();
+            if (!uStubSize || vecParsedSyscalls.size() > SIZE_MAX / uStubSize)
+                return std::nullopt;
 
-            for (size_t i = 0; i < m_vecParsedSyscalls.size(); ++i)
-                m_vecParsedSyscalls[i].m_uOffset = static_cast<uint32_t>(i * IStubGenerationPolicy::getStubSize());
+            const size_t uRegionSize = vecParsedSyscalls.size() * uStubSize;
+            if (uRegionSize > UINT32_MAX)
+                return std::nullopt;
 
+            std::ranges::sort(vecParsedSyscalls, std::less{}, &SyscallEntry_t::m_key);
 
-            std::ranges::sort(m_vecParsedSyscalls, std::less{}, &SyscallEntry_t::m_key);
-
-            m_bInitialized = createSyscalls();
-            if (m_bInitialized)
+            for (size_t i = 1; i < vecParsedSyscalls.size(); ++i)
             {
-                if constexpr (std::is_same_v<IStubGenerationPolicy, policies::generator::exception>)
-                {
-                    m_pVehHandle = AddVectoredExceptionHandler(1, VectoredExceptionHandler);
-                    if (!m_pVehHandle)
+                if (vecParsedSyscalls[i - 1].m_key != vecParsedSyscalls[i].m_key)
+                    continue;
+
+                if (vecParsedSyscalls[i - 1].m_uSyscallNumber != vecParsedSyscalls[i].m_uSyscallNumber)
+                    return std::nullopt;
+            }
+
+            vecParsedSyscalls.erase(
+                std::unique(
+                    vecParsedSyscalls.begin(),
+                    vecParsedSyscalls.end(),
+                    [](const SyscallEntry_t& lhs, const SyscallEntry_t& rhs)
                     {
-                        IAllocationPolicy::release(m_pSyscallRegion, m_hObjectHandle);
-                        m_pSyscallRegion = nullptr;
-                        m_bInitialized = false;
+                        return lhs.m_key == rhs.m_key;
                     }
-                }
-            }
+                ),
+                vecParsedSyscalls.end()
+            );
 
-            return m_bInitialized;
-        }
-        template<typename Ret = uintptr_t, typename... Args>
-        [[nodiscard]] SYSCALL_FORCE_INLINE Ret invoke(const SyscallKey_t& syscallId, Args... args)
-        {
-            if (!m_bInitialized)
+            if (vecParsedSyscalls.size() > 1)
+                for (size_t i = vecParsedSyscalls.size() - 1; i > 0; --i)
+                    std::swap(vecParsedSyscalls[i], vecParsedSyscalls[native::rdtscp() % (i + 1)]);
+
+            for (size_t i = 0; i < vecParsedSyscalls.size(); ++i)
+                vecParsedSyscalls[i].m_uOffset = static_cast<uint32_t>(i * uStubSize);
+
+            std::ranges::sort(vecParsedSyscalls, std::less{}, &SyscallEntry_t::m_key);
+
+
+            std::optional<SyscallInitInfo_t> optSyscallInitInfo = createSyscalls(vecParsedSyscalls, vecSyscallGadgets);
+            if (!optSyscallInitInfo.has_value())
+                return std::nullopt;
+
+            const SyscallInitInfo_t& syscallInitInfo = optSyscallInitInfo.value();
+
+            void* pVehHandle = nullptr;
+            if constexpr (GeneratorTraits<IStubGenerationPolicy>::bRequiresExceptionDispatch)
             {
-                if (!initialize())
+                pVehHandle = detail::acquireVeh();
+                if (!pVehHandle)
                 {
-                    if constexpr (std::is_same_v<Ret, NTSTATUS>)
-                        return native::STATUS_UNSUCCESSFUL;
-
-                    return Ret{};
+                    IAllocationPolicy::release(syscallInitInfo.m_pSyscallRegion, syscallInitInfo.m_hObjectHandle);
+                    return std::nullopt;
                 }
             }
+
+            return ManagerImpl(std::move(vecParsedSyscalls), syscallInitInfo.m_pSyscallRegion, std::move(vecSyscallGadgets), syscallInitInfo.m_uRegionSize, syscallInitInfo.m_hObjectHandle, pVehHandle);
+        }
+
+    public:
+        template<typename Ret = uintptr_t, typename... Args>
+        [[nodiscard]] SYSCALL_FORCE_INLINE Ret invoke(const SyscallKey_t& syscallId, Args... args) const
+        {
             auto it = std::ranges::lower_bound(m_vecParsedSyscalls, syscallId, std::less{}, &SyscallEntry_t::m_key);
 
             if (it == m_vecParsedSyscalls.end() || it->m_key != syscallId)
@@ -296,7 +361,7 @@ namespace syscall
             using Function_t = Ret(SYSCALL_API*)(Args...);
 
             uint8_t* pStubAddress = reinterpret_cast<uint8_t*>(m_pSyscallRegion) + it->m_uOffset;
-            if constexpr (std::is_same_v<IStubGenerationPolicy, policies::generator::exception>)
+            if constexpr (GeneratorTraits<IStubGenerationPolicy>::bRequiresExceptionDispatch)
             {
 #if SYSCALL_PLATFORM_WINDOWS_64
                 const size_t uGadgetCount = m_vecSyscallGadgets.size();
@@ -322,7 +387,7 @@ namespace syscall
         }
     private:
         template<IsSyscallParsingPolicy CurrentParser, IsSyscallParsingPolicy... OtherParsers>
-        std::vector<SyscallEntry_t> tryParseSyscalls(const ModuleInfo_t& moduleInfo)
+        static std::vector<SyscallEntry_t> tryParseSyscalls(const ModuleInfo_t& moduleInfo)
         {
             auto vecSyscalls = CurrentParser::parse(moduleInfo);
 
@@ -336,40 +401,50 @@ namespace syscall
         }
 
 
-        bool createSyscalls()
+        static std::optional<SyscallInitInfo_t> createSyscalls(const std::vector<SyscallEntry_t>& vecParsedSyscalls, const std::vector<void*>& vecSyscallGadgets)
         {
-            if (m_vecParsedSyscalls.empty())
-                return false;
+            if (vecParsedSyscalls.empty())
+                return std::nullopt;
 #if SYSCALL_PLATFORM_WINDOWS_64
-            if constexpr (IStubGenerationPolicy::bRequiresGadget)
-                if (m_vecSyscallGadgets.empty())
-                    return false;
+            if constexpr (GeneratorTraits<IStubGenerationPolicy>::bRequiresGadget)
+                if (vecSyscallGadgets.empty())
+                    return std::nullopt;
 #endif
 
-            m_uRegionSize = m_vecParsedSyscalls.size() * IStubGenerationPolicy::getStubSize();
-            std::vector<uint8_t> vecTempBuffer(m_uRegionSize);
+            std::size_t uRegionSize = vecParsedSyscalls.size() * IStubGenerationPolicy::getStubSize();
+            std::vector<uint8_t> vecTempBuffer(uRegionSize);
 
-            const size_t uGadgetsCount = m_vecSyscallGadgets.size();
+            const size_t uGadgetsCount = vecSyscallGadgets.size();
 
-            for (const SyscallEntry_t& entry : m_vecParsedSyscalls)
+            for (const SyscallEntry_t& entry : vecParsedSyscalls)
             {
                 uint8_t* pStubLocation = vecTempBuffer.data() + entry.m_uOffset;
                 void* pGadgetForStub = nullptr;
 #if SYSCALL_PLATFORM_WINDOWS_64
-                if constexpr (IStubGenerationPolicy::bRequiresGadget)
+                if constexpr (GeneratorTraits<IStubGenerationPolicy>::bRequiresGadget)
                 {
                     const size_t uRandomIndex = native::rdtscp() % uGadgetsCount;
-                    pGadgetForStub = m_vecSyscallGadgets[uRandomIndex];
+                    pGadgetForStub = vecSyscallGadgets[uRandomIndex];
                 }
 #endif
 
                 IStubGenerationPolicy::generate(pStubLocation, entry.m_uSyscallNumber, pGadgetForStub);
             }
 
-            return IAllocationPolicy::allocate(m_uRegionSize, vecTempBuffer, m_pSyscallRegion, m_hObjectHandle);
+            void* pSyscallRegion = nullptr;
+            HANDLE hObjectHandle = {};
+
+            if (!IAllocationPolicy::allocate(uRegionSize, vecTempBuffer, pSyscallRegion, hObjectHandle))
+                return std::nullopt;
+
+            return SyscallInitInfo_t {
+                .m_pSyscallRegion = pSyscallRegion,
+                .m_uRegionSize = uRegionSize,
+                .m_hObjectHandle = hObjectHandle,
+            };
         }
 
-        bool getModuleInfo(SyscallKey_t moduleKey, ModuleInfo_t& info)
+        static bool getModuleInfo(SyscallKey_t moduleKey, ModuleInfo_t& info)
         {
             HMODULE hModule = native::getModuleBase(moduleKey);
             if (!hModule)
@@ -395,11 +470,11 @@ namespace syscall
         }
 
 #if SYSCALL_PLATFORM_WINDOWS_64
-        bool findSyscallGadgets()
+        static std::vector<void*> findSyscallGadgets()
         {
             ModuleInfo_t ntdll;
             if (!getModuleInfo(SYSCALL_ID("ntdll.dll"), ntdll))
-                return false;
+                return {};
 
             IMAGE_SECTION_HEADER* pSections = IMAGE_FIRST_SECTION(ntdll.m_pNtHeaders);
             uint8_t* pTextSection = nullptr;
@@ -415,14 +490,14 @@ namespace syscall
             }
 
             if (!pTextSection || !uTextSectionSize)
-                return false;
+                return {};
 
-            m_vecSyscallGadgets.clear();
+            std::vector<void*> vecSyscallGadgets = {};
             for (DWORD i = 0; i < uTextSectionSize - 2; ++i)
                 if (pTextSection[i] == 0x0F && pTextSection[i + 1] == 0x05 && pTextSection[i + 2] == 0xC3)
-                    m_vecSyscallGadgets.push_back(&pTextSection[i]);
+                    vecSyscallGadgets.push_back(&pTextSection[i]);
 
-            return !m_vecSyscallGadgets.empty();
+            return vecSyscallGadgets;
         }
 #endif
 
@@ -431,4 +506,4 @@ namespace syscall
 
 #include "aliases.hpp"
 
-#endif  
+#endif

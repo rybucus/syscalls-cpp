@@ -36,13 +36,13 @@ namespace syscall::native
             char* m_pszFuncName;
         };
 
-
         inline bool parseForwarderString(const uint8_t* pBase, uint32_t uFunctionRva, ForwarderInfo_t& outInfo)
         {
             const char* szSrc     = reinterpret_cast<const char*>(pBase + uFunctionRva);
             char*       szDest    = outInfo.m_szDllName;
             const char* szDestEnd = szDest + sizeof(outInfo.m_szDllName) - 1;
             char*       pszDot    = nullptr;
+            bool        bTerminated = false;
 
             while (szDest < szDestEnd && (*szDest = *szSrc++))
             {
@@ -51,6 +51,12 @@ namespace syscall::native
 
                 szDest++;
             }
+
+            if (szDest < szDestEnd)
+                bTerminated = (*szDest == '\0');
+
+            if (!bTerminated)
+                return false;
 
             *szDest = '\0';
 
@@ -211,6 +217,9 @@ namespace syscall::native
                 continue;
 
             const uint16_t usOrdinal = pOrdinalsRVA[i];
+            if (usOrdinal >= pExportDir->NumberOfFunctions)
+                return nullptr;
+
             const uint32_t uFunctionRva = pFunctionsRVA[usOrdinal];
             auto uExportSectionStart = uExportDirRva;
             auto uExportSectionEnd = uExportSectionStart + pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
@@ -269,6 +278,9 @@ namespace syscall::native
                 continue;
 
             uint16_t usOrdinal = pOrdinalsRVA[i];
+            if (usOrdinal >= pExportDir->NumberOfFunctions)
+                return nullptr;
+
             uint32_t uFunctionRva = pFunctionsRVA[usOrdinal];
             auto uExportSectionStart = uExportDirRva;
             auto uExportSectionEnd = uExportSectionStart + pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
